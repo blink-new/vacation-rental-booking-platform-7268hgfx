@@ -51,6 +51,49 @@ export const bookingStorage = {
     const bookings = bookingStorage.getAll()
     const filtered = bookings.filter(b => b.id !== id)
     localStorage.setItem('bookingRequests', JSON.stringify(filtered))
+  },
+
+  // Überprüft ob ein Datumsbereich bereits gebucht ist
+  isDateRangeBooked: (propertyId: string, checkIn: Date, checkOut: Date): boolean => {
+    const bookings = bookingStorage.getAll()
+    const approvedBookings = bookings.filter(b => 
+      b.property_id === propertyId && b.status === 'approved'
+    )
+    
+    for (const booking of approvedBookings) {
+      const bookingCheckIn = new Date(booking.check_in)
+      const bookingCheckOut = new Date(booking.check_out)
+      
+      // Überprüfe auf Überschneidungen
+      if (checkIn < bookingCheckOut && checkOut > bookingCheckIn) {
+        return true
+      }
+    }
+    
+    return false
+  },
+
+  // Gibt alle gebuchten Daten für eine Eigenschaft zurück
+  getBookedDatesForProperty: (propertyId: string): string[] => {
+    const bookings = bookingStorage.getAll()
+    const approvedBookings = bookings.filter(b => 
+      b.property_id === propertyId && b.status === 'approved'
+    )
+    
+    const bookedDates: string[] = []
+    
+    for (const booking of approvedBookings) {
+      const checkIn = new Date(booking.check_in)
+      const checkOut = new Date(booking.check_out)
+      const currentDate = new Date(checkIn)
+      
+      while (currentDate < checkOut) {
+        bookedDates.push(currentDate.toISOString().split('T')[0])
+        currentDate.setDate(currentDate.getDate() + 1)
+      }
+    }
+    
+    return bookedDates
   }
 }
 
@@ -106,4 +149,45 @@ export const calculateNights = (checkIn: Date, checkOut: Date): number => {
 
 export const generateId = (prefix: string = 'id'): string => {
   return `${prefix}-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`
+}
+
+// Überprüft die Verfügbarkeit für einen Datumsbereich
+export const checkAvailability = (propertyId: string, checkIn: Date, checkOut: Date): {
+  available: boolean
+  reason?: string
+  conflictingDates?: string[]
+} => {
+  // Überprüfe lokale Buchungen
+  if (bookingStorage.isDateRangeBooked(propertyId, checkIn, checkOut)) {
+    return {
+      available: false,
+      reason: 'Bereits über diese Plattform gebucht',
+      conflictingDates: bookingStorage.getBookedDatesForProperty(propertyId)
+    }
+  }
+
+  // Überprüfe Preisregeln für Verfügbarkeit
+  const currentDate = new Date(checkIn)
+  const unavailableDates: string[] = []
+  
+  while (currentDate < checkOut) {
+    const dateStr = formatDate(currentDate)
+    const rule = pricingStorage.getByDate(propertyId, dateStr)
+    
+    if (rule && !rule.available) {
+      unavailableDates.push(dateStr)
+    }
+    
+    currentDate.setDate(currentDate.getDate() + 1)
+  }
+  
+  if (unavailableDates.length > 0) {
+    return {
+      available: false,
+      reason: 'Manuell als nicht verfügbar markiert',
+      conflictingDates: unavailableDates
+    }
+  }
+  
+  return { available: true }
 }

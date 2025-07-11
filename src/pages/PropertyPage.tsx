@@ -2,7 +2,7 @@ import { useState, useEffect } from 'react'
 import { Link } from 'react-router-dom'
 import { 
   MapPin, Users, Bed, Bath, Wifi, Car, Shield, 
-  Coffee, Home, ArrowLeft, Star, Share 
+  Coffee, Home, ArrowLeft, Star, Share, AlertCircle
 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
@@ -12,8 +12,10 @@ import { Label } from '@/components/ui/label'
 import { Input } from '@/components/ui/input'
 import { Textarea } from '@/components/ui/textarea'
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
+import { Alert, AlertDescription } from '@/components/ui/alert'
 import { toast } from '@/hooks/use-toast'
-import { bookingStorage, pricingStorage, formatDate, calculateNights, generateId } from '@/utils/localStorage'
+import { bookingStorage, pricingStorage, formatDate, calculateNights, generateId, checkAvailability } from '@/utils/localStorage'
+import { airbnbService } from '@/utils/airbnbService'
 import ImageGallery from '@/components/ImageGallery'
 import DatePicker from '@/components/DatePicker'
 
@@ -24,6 +26,13 @@ const PropertyPage = () => {
   const [isSubmitting, setIsSubmitting] = useState(false)
   const [dynamicTotal, setDynamicTotal] = useState(0)
   const [priceLoading, setPriceLoading] = useState(false)
+  const [availabilityStatus, setAvailabilityStatus] = useState<{
+    available: boolean
+    reason?: string
+    source?: 'local' | 'airbnb'
+  }>({ available: true })
+  const [airbnbBookedDates, setAirbnbBookedDates] = useState<string[]>([])
+  const [localBookedDates, setLocalBookedDates] = useState<string[]>([])
   const [bookingForm, setBookingForm] = useState({
     name: '',
     email: '',
@@ -102,35 +111,82 @@ Gut ausgebauter Fahrradweg und Bushaltestelle 400m entfernt.`,
 
   const totalPrice = checkIn && checkOut ? calculateTotalPrice() : 0
 
-  const calculateDynamicPrice = (startDate: Date, endDate: Date) => {
+  const calculateDynamicPrice = async (startDate: Date, endDate: Date) => {
     const currentDate = new Date(startDate)
     let totalPrice = 0
     let isAvailable = true
+    let unavailableSource = ''
     
-    while (currentDate < endDate) {
-      const dateStr = formatDate(currentDate)
-      const rule = pricingStorage.getByDate(property.id.toString(), dateStr)
-      
-      if (rule) {
-        if (!rule.available) {
-          isAvailable = false
-          break
-        }
-        totalPrice += rule.price
-      } else {
-        totalPrice += property.price
+    // 1. Überprüfe lokale Verfügbarkeit
+    const localAvailability = checkAvailability(property.id.toString(), startDate, endDate)
+    if (!localAvailability.available) {
+      return { 
+        totalPrice: 0, 
+        isAvailable: false,
+        reason: localAvailability.reason || 'Nicht verfügbar',
+        source: 'local'
       }
-      
-      currentDate.setDate(currentDate.getDate() + 1)
     }
     
-    return { totalPrice, isAvailable }
+    // 2. Überprüfe Airbnb-Verfügbarkeit
+    try {
+      const airbnbData = await airbnbService.getComprehensiveAvailability(
+        property.id.toString(),
+        startDate,
+        endDate
+      )
+      
+      for (const dayData of airbnbData) {
+        if (!dayData.available) {
+          return {
+            totalPrice: 0,
+            isAvailable: false,
+            reason: dayData.reason || 'Bereits über Airbnb gebucht',
+            source: 'airbnb'
+          }
+        }
+        totalPrice += dayData.price
+      }
+    } catch (error) {
+      console.error('Airbnb availability check failed:', error)
+      
+      // Fallback: Lokale Preisberechnung
+      while (currentDate < endDate) {
+        const dateStr = formatDate(currentDate)
+        const rule = pricingStorage.getByDate(property.id.toString(), dateStr)
+        
+        if (rule) {
+          if (!rule.available) {
+            isAvailable = false
+            unavailableSource = 'local'
+            break
+          }
+          totalPrice += rule.price
+        } else {
+          totalPrice += property.price
+        }
+        
+        currentDate.setDate(currentDate.getDate() + 1)
+      }
+    }
+    
+    return { 
+      totalPrice, 
+      isAvailable,
+      reason: isAvailable ? undefined : 'Nicht verfügbar',
+      source: unavailableSource || 'local'
+    }
   }
 
   const handleBookingSubmit = async (e: React.FormEvent) => {
     e.preventDefault()
     if (!checkIn || !checkOut) {
       toast({ title: 'Fehler', description: 'Bitte wählen Sie Check-in und Check-out Daten', variant: 'destructive' })
+      return
+    }
+
+    if (!availabilityStatus.available) {
+      toast({ title: 'Fehler', description: 'Die gewählten Daten sind nicht verfügbar', variant: 'destructive' })
       return
     }
 
@@ -160,6 +216,7 @@ Gut ausgebauter Fahrradweg und Bushaltestelle 400m entfernt.`,
       setCheckIn(undefined)
       setCheckOut(undefined)
       setGuests('2')
+      setAvailabilityStatus({ available: true })
       
     } catch (error) {
       console.error('Booking error:', error)
@@ -183,16 +240,62 @@ Gut ausgebauter Fahrradweg und Bushaltestelle 400m entfernt.`,
     }
   }
 
+  const isDateDisabled = (date: Date) => {
+    const dateStr = formatDate(date)
+    return date < new Date() || 
+           airbnbBookedDates.includes(dateStr) || 
+           localBookedDates.includes(dateStr)
+  }
+
+  useEffect(() => {
+    // Lade gebuchte Daten beim Mount
+    const propertyId = property.id.toString()
+    setLocalBookedDates(bookingStorage.getBookedDatesForProperty(propertyId))
+    
+    // Lade Airbnb-Daten für die nächsten 3 Monate
+    const today = new Date()
+    const futureDate = new Date(today)
+    futureDate.setMonth(futureDate.getMonth() + 3)
+    
+    airbnbService.getComprehensiveAvailability(propertyId, today, futureDate)
+      .then(data => {
+        const bookedDates = data.filter(d => !d.available).map(d => d.date)
+        setAirbnbBookedDates(bookedDates)
+      })
+      .catch(error => {
+        console.error('Failed to load Airbnb availability:', error)
+      })
+  }, [])
+
   useEffect(() => {
     if (checkIn && checkOut) {
       setPriceLoading(true)
-      const { totalPrice, isAvailable } = calculateDynamicPrice(checkIn, checkOut)
-      setDynamicTotal(totalPrice)
-      if (!isAvailable) {
-        toast({ title: 'Fehler', description: 'Ausgewählte Daten sind nicht verfügbar', variant: 'destructive' })
-        setCheckOut(undefined)
-      }
-      setPriceLoading(false)
+      setAvailabilityStatus({ available: true })
+      
+      calculateDynamicPrice(checkIn, checkOut)
+        .then(result => {
+          setDynamicTotal(result.totalPrice)
+          setAvailabilityStatus({
+            available: result.isAvailable,
+            reason: result.reason,
+            source: result.source
+          })
+          
+          if (!result.isAvailable) {
+            toast({ 
+              title: 'Nicht verfügbar', 
+              description: result.reason || 'Die gewählten Daten sind nicht verfügbar', 
+              variant: 'destructive' 
+            })
+          }
+        })
+        .catch(error => {
+          console.error('Price calculation failed:', error)
+          toast({ title: 'Fehler', description: 'Fehler beim Laden der Preise', variant: 'destructive' })
+        })
+        .finally(() => {
+          setPriceLoading(false)
+        })
     }
   }, [checkIn, checkOut])
 
@@ -328,7 +431,7 @@ Gut ausgebauter Fahrradweg und Bushaltestelle 400m entfernt.`,
                         placeholder="Datum wählen"
                         value={checkIn}
                         onChange={setCheckIn}
-                        disabled={(date) => date < new Date()}
+                        disabled={isDateDisabled}
                         className="mt-1"
                       />
                     </div>
@@ -338,7 +441,7 @@ Gut ausgebauter Fahrradweg und Bushaltestelle 400m entfernt.`,
                         placeholder="Datum wählen"
                         value={checkOut}
                         onChange={setCheckOut}
-                        disabled={(date) => date < new Date() || (checkIn && date <= checkIn)}
+                        disabled={(date) => isDateDisabled(date) || (checkIn && date <= checkIn)}
                         className="mt-1"
                       />
                     </div>
@@ -364,6 +467,20 @@ Gut ausgebauter Fahrradweg und Bushaltestelle 400m entfernt.`,
                       </SelectContent>
                     </Select>
                   </div>
+
+                  {checkIn && checkOut && !availabilityStatus.available && (
+                    <Alert variant="destructive">
+                      <AlertCircle className="h-4 w-4" />
+                      <AlertDescription>
+                        <strong>Nicht verfügbar:</strong> {availabilityStatus.reason}
+                        {availabilityStatus.source === 'airbnb' && (
+                          <span className="block text-sm mt-1">
+                            Diese Daten sind bereits über Airbnb gebucht.
+                          </span>
+                        )}
+                      </AlertDescription>
+                    </Alert>
+                  )}
 
                   <Separator />
 
@@ -409,7 +526,7 @@ Gut ausgebauter Fahrradweg und Bushaltestelle 400m entfernt.`,
                     </div>
                   </div>
 
-                  {checkIn && checkOut && (
+                  {checkIn && checkOut && availabilityStatus.available && (
                     <div className="space-y-2 pt-4 border-t">
                       <div className="flex justify-between text-sm">
                         <span>€{property.price} x {calculateNights(checkIn, checkOut) || 0} Nächte</span>
@@ -434,9 +551,12 @@ Gut ausgebauter Fahrradweg und Bushaltestelle 400m entfernt.`,
                   <Button 
                     type="submit" 
                     className="w-full bg-rose-600 hover:bg-rose-700"
-                    disabled={isSubmitting || priceLoading}
+                    disabled={isSubmitting || priceLoading || !availabilityStatus.available}
                   >
-                    {isSubmitting ? 'Wird gesendet...' : priceLoading ? 'Preise werden geladen...' : 'Buchungsanfrage senden'}
+                    {isSubmitting ? 'Wird gesendet...' : 
+                     priceLoading ? 'Preise werden geladen...' : 
+                     !availabilityStatus.available ? 'Nicht verfügbar' :
+                     'Buchungsanfrage senden'}
                   </Button>
                   
                   <p className="text-center text-sm text-gray-500">
